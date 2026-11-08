@@ -517,6 +517,7 @@ def apply_monkey_patch(
         )
 
         from verl.models.transformers.qwen3_5 import (
+            _report_native_gdn,
             fast_pos_embed_interpolate,
             forward_with_normal_backend,
             qwen3_5_base_forward,
@@ -524,6 +525,7 @@ def apply_monkey_patch(
             qwen3_5_gated_delta_net_forward,
         )
 
+        _report_native_gdn(model, ulysses_sp_size)
         Qwen3_5Model.forward = qwen3_5_base_forward
         Qwen3_5MoeModel.forward = qwen3_5_base_forward
         Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward

@@ -16,7 +16,8 @@ import logging
 import os
 from dataclasses import dataclass
 from importlib import import_module
-from inspect import signature
+from inspect import signature, unwrap
+from types import MethodType
 from typing import Optional
 
 import torch
@@ -41,6 +42,48 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 def _call_accepts_kwarg(fn, name: str) -> bool:
     params = signature(fn).parameters
     return name in params or any(param.kind == param.VAR_KEYWORD for param in params.values())
+
+
+def _use_native_gdn() -> bool:
+    return os.getenv("VERL_QWEN35_NATIVE_GDN") == "1"
+
+
+def _native_gdn_kernels(module):
+    # Recent Transformers functions named torch_* are decorated dispatchers that
+    # can select FLA / hub kernels. Unwrap them to force the actual torch reference.
+    kernels = []
+    for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
+        kernel = getattr(module, name, None)
+        if not callable(kernel):
+            raise RuntimeError(f"VERL_QWEN35_NATIVE_GDN=1 requires {module.__name__}.{name}.")
+        kernels.append(unwrap(kernel))
+    update = getattr(module, "torch_causal_conv1d_update", None)
+    if update is None:
+        update = getattr(module, "causal_conv1d_update", None)
+    if not callable(update):
+        raise RuntimeError(f"VERL_QWEN35_NATIVE_GDN=1 requires a native causal conv update in {module.__name__}.")
+    update = unwrap(update)
+    if not hasattr(module, "torch_causal_conv1d_update") and update.__module__ != module.__name__:
+        raise RuntimeError(f"Cannot identify a native causal conv update in {module.__name__}.")
+    return kernels[0], kernels[1], update
+
+
+def _report_native_gdn(model, ulysses_sp_size: int):
+    if not _use_native_gdn():
+        return
+    if ulysses_sp_size > 1:
+        raise NotImplementedError("VERL_QWEN35_NATIVE_GDN=1 requires ulysses_sequence_parallel_size=1; SP needs FLA.")
+    # Validate before the first forward, on every actor/reference model patch.
+    layers = 0
+    for layer in model.modules():
+        if layer.__class__.__name__ in ("Qwen3_5GatedDeltaNet", "Qwen3_5MoeGatedDeltaNet"):
+            _native_gdn_kernels(import_module(layer.__class__.__module__))
+            layers += 1
+    print(
+        f"[Qwen3.5] VERL_QWEN35_NATIVE_GDN=1: {model.__class__.__name__}, {layers} DeltaNet layers; "
+        "forcing unwrapped Transformers torch chunk/recurrent GDN and native torch causal conv, "
+        "packed sequences split independently, SP=1 only; norm and LM-head backend unchanged."
+    )
 
 
 def _prepare_packed_seq_idx(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: Optional[torch.LongTensor]):
@@ -156,7 +199,16 @@ def _packed_causal_conv1d_fallback(
 
 
 def _packed_chunk_gated_delta_rule(
-    chunk_gated_delta_rule, query, key, value, g, beta, cu_seqlens, cu_seqlens_cpu, cp_context=None
+    chunk_gated_delta_rule,
+    query,
+    key,
+    value,
+    g,
+    beta,
+    cu_seqlens,
+    cu_seqlens_cpu,
+    cp_context=None,
+    force_split=False,
 ):
     kwargs = {
         "g": g,
@@ -169,12 +221,15 @@ def _packed_chunk_gated_delta_rule(
         return chunk_gated_delta_rule(query, key, value, **kwargs)
 
     if cp_context is not None:
+        if force_split:
+            raise NotImplementedError("Native Qwen3.5 GDN cannot handle FLA cp_context; use SP=1.")
         if not _call_accepts_kwarg(chunk_gated_delta_rule, "cp_context"):
             raise NotImplementedError("Qwen3.5 Ulysses SP requires FLA chunk_gated_delta_rule cp_context support.")
         kwargs["cp_context"] = cp_context
         return chunk_gated_delta_rule(query, key, value, **kwargs)
 
-    if _call_accepts_kwarg(chunk_gated_delta_rule, "cu_seqlens"):
+    # Native torch kernels may accept **kwargs while ignoring cu_seqlens.
+    if not force_split and _call_accepts_kwarg(chunk_gated_delta_rule, "cu_seqlens"):
         kwargs["cu_seqlens"] = cu_seqlens
         if _call_accepts_kwarg(chunk_gated_delta_rule, "cu_seqlens_cpu"):
             kwargs["cu_seqlens_cpu"] = cu_seqlens_cpu
@@ -203,20 +258,32 @@ def qwen3_5_gated_delta_net_forward(
     if cu_seqlens is not None and cache_params is not None:
         raise NotImplementedError("Packed Qwen3.5 linear attention does not support cached forward.")
 
+    native_gdn = _use_native_gdn()
+    if native_gdn and get_ulysses_sequence_parallel_world_size() > 1:
+        raise NotImplementedError("VERL_QWEN35_NATIVE_GDN=1 requires ulysses_sequence_parallel_size=1; SP needs FLA.")
+
     module = import_module(self.__class__.__module__)
     hidden_states = module.apply_mask_to_padding_states(hidden_states, attention_mask)
-    causal_conv1d_fn = self.causal_conv1d_fn if hasattr(self, "causal_conv1d_fn") else module.causal_conv1d_fn
-    causal_conv1d_update = (
-        self.causal_conv1d_update if hasattr(self, "causal_conv1d_update") else module.causal_conv1d_update
-    )
-    chunk_gated_delta_rule = (
-        self.chunk_gated_delta_rule if hasattr(self, "chunk_gated_delta_rule") else module.torch_chunk_gated_delta_rule
-    )
-    recurrent_gated_delta_rule = (
-        self.recurrent_gated_delta_rule
-        if hasattr(self, "recurrent_gated_delta_rule")
-        else module.torch_recurrent_gated_delta_rule
-    )
+    if native_gdn:
+        chunk_gated_delta_rule, recurrent_gated_delta_rule, causal_conv1d_update = _native_gdn_kernels(module)
+        # Use the existing boundary-aware torch convolution fallback, not a
+        # decorated causal_conv1d_fn that could select an external kernel.
+        causal_conv1d_fn = None
+    else:
+        causal_conv1d_fn = self.causal_conv1d_fn if hasattr(self, "causal_conv1d_fn") else module.causal_conv1d_fn
+        causal_conv1d_update = (
+            self.causal_conv1d_update if hasattr(self, "causal_conv1d_update") else module.causal_conv1d_update
+        )
+        chunk_gated_delta_rule = (
+            self.chunk_gated_delta_rule
+            if hasattr(self, "chunk_gated_delta_rule")
+            else module.torch_chunk_gated_delta_rule
+        )
+        recurrent_gated_delta_rule = (
+            self.recurrent_gated_delta_rule
+            if hasattr(self, "recurrent_gated_delta_rule")
+            else module.torch_recurrent_gated_delta_rule
+        )
 
     batch_size, seq_len, _ = hidden_states.shape
     cp_context = None
@@ -332,6 +399,7 @@ def qwen3_5_gated_delta_net_forward(
             model_cu_seqlens,
             model_cu_seqlens_cpu,
             cp_context,
+            force_split=native_gdn,
         )
     else:
         core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
@@ -579,6 +647,42 @@ def forward_with_normal_backend(
     )
 
 
+def _fused_lm_head_forward(self, hidden_states, input_ids, temperature, backend):
+    # This method runs inside lm_head's FSDP pre/post-forward hooks. Reading the
+    # weight in the parent forward bypasses child unsharding (and CPU offload).
+    vocab_weights = self.weight
+    if isinstance(vocab_weights, DTensor):
+        vocab_weights = vocab_weights.full_tensor()
+    hidden_states = hidden_states.to(vocab_weights.dtype)
+    if backend == "triton":
+        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+
+        return linear_cross_entropy(hidden_states, vocab_weights, input_ids, temperature, "none")
+
+    from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+    return FusedLinearForPPO(impl_backend=backend).forward(
+        hidden_states=hidden_states,
+        vocab_weights=vocab_weights,
+        input_ids=input_ids,
+        temperature=temperature,
+    )
+
+
+def _call_fused_lm_head(lm_head, hidden_states, input_ids, temperature, backend):
+    method_name = "_verl_fused_lm_head_forward"
+    if not hasattr(lm_head, method_name):
+        setattr(lm_head, method_name, MethodType(_fused_lm_head_forward, lm_head))
+    # Registration must happen after fully_shard, not only at model patch time.
+    # Keep it idempotent across old-logprob, reference and actor microbatches.
+    from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
+
+    if isinstance(lm_head, FSDPModule) and not getattr(lm_head, "_verl_fused_lm_head_registered", False):
+        register_fsdp_forward_method(lm_head, method_name)
+        lm_head._verl_fused_lm_head_registered = True
+    return getattr(lm_head, method_name)(hidden_states, input_ids, temperature, backend)
+
+
 def forward_with_torch_backend(
     self: "Qwen3_5ForConditionalGeneration",
     input_ids: torch.LongTensor = None,
@@ -589,8 +693,6 @@ def forward_with_torch_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
-    from verl.utils.experimental.torch_functional import FusedLinearForPPO
-
     if cu_seqlens is not None:
         kwargs["cu_seqlens"] = cu_seqlens
     if cu_seqlens_cpu is not None:
@@ -609,22 +711,17 @@ def forward_with_torch_backend(
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
-    fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
-    vocab_weights = self.lm_head.weight
-    if isinstance(vocab_weights, DTensor):
-        vocab_weights = vocab_weights.full_tensor()
-
     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
     if shift_labels is None and ulysses_sequence_parallel_size > 1:
         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
-    hidden_states = hidden_states.to(vocab_weights.dtype)  # bf16 to float
-    log_probs, entropy = fused_linear_for_ppo.forward(
-        hidden_states=hidden_states,
-        vocab_weights=vocab_weights,
-        input_ids=rolled_labels,
-        temperature=temperature,
+    log_probs, entropy = _call_fused_lm_head(
+        self.lm_head,
+        hidden_states,
+        rolled_labels,
+        temperature,
+        getattr(self, "_verl_fused_kernels_backend", "torch"),
     )
     return Qwen3_5CausalLMOutputForPPO(
         log_probs=log_probs,
@@ -643,8 +740,6 @@ def forward_with_triton_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
-    from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
-
     if cu_seqlens is not None:
         kwargs["cu_seqlens"] = cu_seqlens
     if cu_seqlens_cpu is not None:
@@ -668,18 +763,7 @@ def forward_with_triton_backend(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
 
-    vocab_weights = self.lm_head.weight
-    hidden_states = hidden_states.to(vocab_weights.dtype)
-    if isinstance(vocab_weights, DTensor):
-        vocab_weights = vocab_weights.full_tensor()
-
-    log_probs, entropy = linear_cross_entropy(
-        hidden_states,
-        vocab_weights,
-        rolled_labels,
-        temperature,
-        "none",
-    )
+    log_probs, entropy = _call_fused_lm_head(self.lm_head, hidden_states, rolled_labels, temperature, "triton")
     return Qwen3_5CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,

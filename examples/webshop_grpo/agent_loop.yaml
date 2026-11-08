@@ -1,0 +1,2 @@
+- name: webshop
+  _target_: examples.webshop_grpo.webshop_agent.WebShopAgentLoop
